@@ -7,6 +7,7 @@ Commands:
   /start /help  - intro + your chat id
   /today        - today's pollen and the symptoms you logged today
   /week         - last 7 days: symptom counts vs grass/birch peaks
+  /analyze      - 30-day correlation between symptoms and pollen levels
 
 Run with:  python bot.py
 """
@@ -83,6 +84,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/today - today's pollen + your logged symptoms\n"
         "/week - last 7 days summary\n"
+        "/analyze - 30-day symptom/pollen correlation\n"
         "/log YYYY-MM-DD [HH:MM] <text> - log a historical symptom\n"
         "/delete YYYY-MM-DD - remove all logged symptoms for that date\n"
         "/help - show this again\n\n"
@@ -198,6 +200,119 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def analyze(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """30-day overview of symptom/pollen correlation."""
+    if not _authorized(update):
+        return
+
+    now = datetime.now(TZ)
+    window_days = 30
+    start = (now - timedelta(days=window_days - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    # One DB fetch for the whole window, then group by date
+    all_syms = db.symptoms_between(start.isoformat(), end.isoformat())
+    syms_by_date: dict[str, list] = {}
+    for s in all_syms:
+        d = datetime.fromisoformat(s["ts"]).date().isoformat()
+        syms_by_date.setdefault(d, []).append(s)
+
+    # Build pollen lookup: date -> species -> max_value
+    pollen_by_date: dict[str, dict[str, float]] = {}
+    for row in pollen_store.read_rows():
+        d = row["date"]
+        pollen_by_date.setdefault(d, {})[row["species"]] = row["max_value"] or 0.0
+
+    # Per-day records covering only days that have pollen data
+    days = []
+    for i in range(window_days):
+        day = (start + timedelta(days=i)).date().isoformat()
+        if day not in pollen_by_date:
+            continue
+        syms = syms_by_date.get(day, [])
+        days.append(
+            {
+                "date": day,
+                "has_symptoms": bool(syms),
+                "symptom_count": len(syms),
+                "severities": [s["severity"] for s in syms if s["severity"] is not None],
+                "pollen": pollen_by_date[day],
+            }
+        )
+
+    if not days:
+        await update.message.reply_text(
+            "No pollen data found for the last 30 days — the collector may not have run yet."
+        )
+        return
+
+    symptom_days = [d for d in days if d["has_symptoms"]]
+    clear_days = [d for d in days if not d["has_symptoms"]]
+
+    def avg(vals):
+        return sum(vals) / len(vals) if vals else 0.0
+
+    def avg_pollen(day_list, species):
+        return avg([d["pollen"].get(species, 0.0) for d in day_list])
+
+    species_present = sorted(
+        {sp for d in days for sp in d["pollen"] if d["pollen"][sp] > 0}
+    )
+
+    total_entries = sum(d["symptom_count"] for d in days)
+    pct_symptom = round(100 * len(symptom_days) / len(days))
+    start_label = start.strftime("%d %b")
+    end_label = now.strftime("%d %b")
+
+    lines = [
+        f"*Allergy Analysis* ({start_label} – {end_label})",
+        "",
+        f"Days with pollen data: {len(days)}",
+        f"Days with symptoms logged: {len(symptom_days)} ({pct_symptom}%)",
+        f"Total symptom entries: {total_entries}",
+    ]
+
+    # Symptom days vs clear days pollen comparison
+    if symptom_days and clear_days:
+        lines += ["", "*Avg pollen: symptom days vs clear days*"]
+        for sp in species_present:
+            name = sp.replace("_pollen", "").capitalize()
+            on = avg_pollen(symptom_days, sp)
+            off = avg_pollen(clear_days, sp)
+            diff = on - off
+            arrow = "↑" if diff > 5 else ("↓" if diff < -5 else "≈")
+            lines.append(f"  {name}: {on:.0f} vs {off:.0f} g/m³  {arrow}")
+
+    # High-grass days
+    GRASS_HIGH = 30
+    grass_high = [d for d in days if d["pollen"].get("grass_pollen", 0) >= GRASS_HIGH]
+    if grass_high:
+        had_syms = sum(1 for d in grass_high if d["has_symptoms"])
+        pct = round(100 * had_syms / len(grass_high))
+        lines += [
+            "",
+            f"*High grass days (≥{GRASS_HIGH} g/m³):* {len(grass_high)}",
+            f"  → symptoms on {had_syms}/{len(grass_high)} ({pct}%)",
+        ]
+
+    # Severity vs pollen (need at least a few rated days)
+    all_severities = [sv for d in days for sv in d["severities"]]
+    if len(all_severities) >= 3:
+        low_days = [d for d in days if d["severities"] and max(d["severities"]) <= 2]
+        high_days = [d for d in days if d["severities"] and max(d["severities"]) >= 4]
+        if low_days and high_days:
+            lines += ["", "*Severity vs pollen (low ≤2 vs high ≥4)*"]
+            for sp in species_present:
+                name = sp.replace("_pollen", "").capitalize()
+                lo = avg_pollen(low_days, sp)
+                hi = avg_pollen(high_days, sp)
+                lines.append(f"  {name}: mild {lo:.0f} vs severe {hi:.0f} g/m³")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
@@ -227,6 +342,7 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("week", week))
+    app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("log", log_historical))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_symptom))
