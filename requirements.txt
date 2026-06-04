@@ -1,0 +1,7 @@
+# Full set for the Mac (bot + analysis).
+# The GitHub Actions collector installs only `requests` (see the workflow).
+requests>=2.31
+python-telegram-bot>=21,<23
+python-dotenv>=1.0
+pandas>=2.0
+matplotlib>=3.7

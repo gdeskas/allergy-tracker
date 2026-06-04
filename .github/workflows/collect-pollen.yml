@@ -1,0 +1,41 @@
+name: collect-pollen
+
+on:
+  schedule:
+    - cron: "0 6 * * *"      # ~06:00 UTC daily (GitHub timing is best-effort)
+  workflow_dispatch: {}        # manual "Run workflow" button for testing
+
+permissions:
+  contents: write              # needed to commit the updated CSV back
+
+concurrency:
+  group: collect-pollen        # never overlap runs
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Collect pollen
+        run: python collect_pollen.py
+
+      - name: Commit updated pollen data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/pollen.csv
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "pollen: update $(date -u +%F)"
+            git push
+          fi
