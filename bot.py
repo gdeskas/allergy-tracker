@@ -13,7 +13,7 @@ Run with:  python bot.py
 """
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import date as date_type, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -201,36 +201,40 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analyze(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    """30-day overview of symptom/pollen correlation."""
+    """Full-history overview of symptom/pollen correlation."""
     if not _authorized(update):
         return
 
     now = datetime.now(TZ)
-    window_days = 30
-    start = (now - timedelta(days=window_days - 1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-    # One DB fetch for the whole window, then group by date
-    all_syms = db.symptoms_between(start.isoformat(), end.isoformat())
+    # Fetch all pollen data first to determine the earliest date available
+    all_pollen_rows = pollen_store.read_rows()
+    pollen_by_date: dict[str, dict[str, float]] = {}
+    for row in all_pollen_rows:
+        d = row["date"]
+        pollen_by_date.setdefault(d, {})[row["species"]] = row["max_value"] or 0.0
+
+    # Fetch all symptoms (no lower bound)
+    all_syms = db.symptoms_between("0000-01-01", now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat())
     syms_by_date: dict[str, list] = {}
     for s in all_syms:
         d = datetime.fromisoformat(s["ts"]).date().isoformat()
         syms_by_date.setdefault(d, []).append(s)
 
-    # Build pollen lookup: date -> species -> max_value
-    pollen_by_date: dict[str, dict[str, float]] = {}
-    for row in pollen_store.read_rows():
-        d = row["date"]
-        pollen_by_date.setdefault(d, {})[row["species"]] = row["max_value"] or 0.0
+    # Determine window from earliest data point across both sources
+    all_dates = sorted({*pollen_by_date.keys(), *syms_by_date.keys()})
+    if not all_dates:
+        await update.message.reply_text("No data recorded yet.")
+        return
+    start_date = all_dates[0]
+    end_date = now.date().isoformat()
 
-    # Per-day records covering only days that have pollen data
+    # Build per-day records for the full window
+    cursor = date_type.fromisoformat(start_date)
+    end = date_type.fromisoformat(end_date)
     days = []
-    for i in range(window_days):
-        day = (start + timedelta(days=i)).date().isoformat()
-        if day not in pollen_by_date:
-            continue
+    while cursor <= end:
+        day = cursor.isoformat()
         syms = syms_by_date.get(day, [])
         days.append(
             {
@@ -238,15 +242,16 @@ async def analyze(update: Update, _context: ContextTypes.DEFAULT_TYPE):
                 "has_symptoms": bool(syms),
                 "symptom_count": len(syms),
                 "severities": [s["severity"] for s in syms if s["severity"] is not None],
-                "pollen": pollen_by_date[day],
+                "pollen": pollen_by_date.get(day, {}),
+                "has_pollen": day in pollen_by_date,
             }
         )
+        cursor += timedelta(days=1)
 
-    if not days:
-        await update.message.reply_text(
-            "No pollen data found for the last 30 days — the collector may not have run yet."
-        )
-        return
+    window_days = len(days)
+
+    # Correlation analysis requires pollen data — use only the overlap
+    overlap_days = [d for d in days if d["has_pollen"]]
 
     symptom_days = [d for d in days if d["has_symptoms"]]
     clear_days = [d for d in days if not d["has_symptoms"]]
@@ -258,53 +263,90 @@ async def analyze(update: Update, _context: ContextTypes.DEFAULT_TYPE):
         return avg([d["pollen"].get(species, 0.0) for d in day_list])
 
     species_present = sorted(
-        {sp for d in days for sp in d["pollen"] if d["pollen"][sp] > 0}
+        {sp for d in overlap_days for sp in d["pollen"] if d["pollen"][sp] > 0}
     )
 
     total_entries = sum(d["symptom_count"] for d in days)
     pct_symptom = round(100 * len(symptom_days) / len(days))
-    start_label = start.strftime("%d %b")
-    end_label = now.strftime("%d %b")
+    start_label = datetime.strptime(start_date, "%Y-%m-%d").strftime("%d %b %Y")
+    end_label = now.strftime("%d %b %Y")
 
     lines = [
         f"*Allergy Analysis* ({start_label} – {end_label})",
         "",
-        f"Days with pollen data: {len(days)}",
-        f"Days with symptoms logged: {len(symptom_days)} ({pct_symptom}%)",
+        f"Days with symptoms logged: {len(symptom_days)}/{window_days} ({pct_symptom}%)",
         f"Total symptom entries: {total_entries}",
+        f"Days with pollen data: {len(overlap_days)}",
     ]
 
-    # Symptom days vs clear days pollen comparison
-    if symptom_days and clear_days:
-        lines += ["", "*Avg pollen: symptom days vs clear days*"]
+    if not overlap_days:
+        lines.append("\nNot enough pollen data yet for correlation analysis.")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    # Correlation: restrict to days that have pollen data
+    overlap_symptom = [d for d in overlap_days if d["has_symptoms"]]
+    overlap_clear = [d for d in overlap_days if not d["has_symptoms"]]
+
+    triggers: list[tuple] = []
+
+    if overlap_symptom and overlap_clear:
+        # Score each species: ratio + absolute lift on symptom days vs clear days
+        scores = []
         for sp in species_present:
-            name = sp.replace("_pollen", "").capitalize()
-            on = avg_pollen(symptom_days, sp)
-            off = avg_pollen(clear_days, sp)
+            on = avg_pollen(overlap_symptom, sp)
+            off = avg_pollen(overlap_clear, sp)
             diff = on - off
+            ratio = on / off if off > 0 else (999.0 if on > 0 else 1.0)
+            scores.append((sp, on, off, diff, ratio))
+        scores.sort(key=lambda x: x[4], reverse=True)
+
+        triggers = [
+            (sp, on, off, diff, ratio)
+            for sp, on, off, diff, ratio in scores
+            if ratio >= 1.3 and diff >= 5
+        ]
+
+        if triggers:
+            lines += ["", "*Likely triggers*"]
+            for sp, on, off, diff, ratio in triggers:
+                name = sp.replace("_pollen", "").capitalize()
+                label = "Strong" if ratio >= 1.8 and diff >= 10 else "Possible"
+                lines.append(f"  {label}: {name} ({ratio:.1f}× higher on symptom days)")
+
+        lines += ["", "*Species ranked by symptom correlation*"]
+        for sp, on, off, diff, ratio in scores:
+            name = sp.replace("_pollen", "").capitalize()
             arrow = "↑" if diff > 5 else ("↓" if diff < -5 else "≈")
             lines.append(f"  {name}: {on:.0f} vs {off:.0f} g/m³  {arrow}")
 
-    # High-grass days
-    GRASS_HIGH = 30
-    grass_high = [d for d in days if d["pollen"].get("grass_pollen", 0) >= GRASS_HIGH]
-    if grass_high:
-        had_syms = sum(1 for d in grass_high if d["has_symptoms"])
-        pct = round(100 * had_syms / len(grass_high))
-        lines += [
-            "",
-            f"*High grass days (≥{GRASS_HIGH} g/m³):* {len(grass_high)}",
-            f"  → symptoms on {had_syms}/{len(grass_high)} ({pct}%)",
-        ]
+    # For top trigger species: show symptom hit rate above vs below median pollen
+    for sp, on, off, diff, ratio in triggers[:2]:
+        vals = sorted(d["pollen"].get(sp, 0.0) for d in overlap_days)
+        n = len(vals)
+        med = (vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2) if vals else 0.0
+        above = [d for d in overlap_days if d["pollen"].get(sp, 0.0) > med]
+        below = [d for d in overlap_days if d["pollen"].get(sp, 0.0) <= med]
+        if above and below:
+            name = sp.replace("_pollen", "").capitalize()
+            above_pct = round(100 * sum(1 for d in above if d["has_symptoms"]) / len(above))
+            below_pct = round(100 * sum(1 for d in below if d["has_symptoms"]) / len(below))
+            lines += [
+                "",
+                f"*{name}: above vs below median ({med:.0f} g/m³)*",
+                f"  High days: symptoms on {above_pct}% of days",
+                f"  Low days:  symptoms on {below_pct}% of days",
+            ]
 
-    # Severity vs pollen (need at least a few rated days)
-    all_severities = [sv for d in days for sv in d["severities"]]
+    # Severity vs pollen — focus on trigger species if available
+    all_severities = [sv for d in overlap_days for sv in d["severities"]]
     if len(all_severities) >= 3:
-        low_days = [d for d in days if d["severities"] and max(d["severities"]) <= 2]
-        high_days = [d for d in days if d["severities"] and max(d["severities"]) >= 4]
+        low_days = [d for d in overlap_days if d["severities"] and max(d["severities"]) <= 2]
+        high_days = [d for d in overlap_days if d["severities"] and max(d["severities"]) >= 4]
         if low_days and high_days:
-            lines += ["", "*Severity vs pollen (low ≤2 vs high ≥4)*"]
-            for sp in species_present:
+            check_species = [sp for sp, *_ in triggers] if triggers else species_present
+            lines += ["", "*Severity vs pollen (mild ≤2 vs severe ≥4)*"]
+            for sp in check_species:
                 name = sp.replace("_pollen", "").capitalize()
                 lo = avg_pollen(low_days, sp)
                 hi = avg_pollen(high_days, sp)
