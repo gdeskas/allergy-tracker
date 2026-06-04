@@ -1,0 +1,7 @@
+.env
+allergy.db
+allergy.db-*
+symptoms_vs_pollen.png
+__pycache__/
+*.pyc
+.venv/
