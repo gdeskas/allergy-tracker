@@ -83,6 +83,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/today - today's pollen + your logged symptoms\n"
         "/week - last 7 days summary\n"
+        "/log YYYY-MM-DD [HH:MM] <text> - log a historical symptom\n"
         "/delete YYYY-MM-DD - remove all logged symptoms for that date\n"
         "/help - show this again\n\n"
         f"Your chat id is {chat_id}. Put it in ALLOWED_CHAT_ID to keep the bot private."
@@ -123,6 +124,45 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         msg.append("No symptoms logged today.")
     await update.message.reply_text("\n".join(msg), parse_mode="Markdown")
+
+
+async def log_historical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /log YYYY-MM-DD [HH:MM] <symptom text>"""
+    if not _authorized(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /log YYYY-MM-DD [HH:MM] <symptom text>\n"
+            "Example: /log 2026-06-01 10:30 sneezing and itchy eyes 3/5"
+        )
+        return
+
+    try:
+        target_date = datetime.strptime(args[0], "%Y-%m-%d").date()
+    except ValueError:
+        await update.message.reply_text("Date must be YYYY-MM-DD. Example: /log 2026-06-01 sneezing")
+        return
+
+    rest = args[1:]
+    hour, minute = 12, 0
+    if rest and re.match(r"^\d{1,2}:\d{2}$", rest[0]):
+        try:
+            hour, minute = (int(x) for x in rest[0].split(":"))
+            rest = rest[1:]
+        except ValueError:
+            pass
+
+    if not rest:
+        await update.message.reply_text("Please include a symptom description after the date.")
+        return
+
+    notes = " ".join(rest)
+    severity = parse_severity(notes)
+    ts = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=TZ)
+    db.insert_symptom(ts.isoformat(), severity, notes, str(update.effective_chat.id), notes)
+    sev_str = f" (severity {severity}/5)" if severity is not None else ""
+    await update.message.reply_text(f"Logged for {ts:%Y-%m-%d %H:%M}{sev_str}: {notes}")
 
 
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,6 +227,7 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("week", week))
+    app.add_handler(CommandHandler("log", log_historical))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_symptom))
 
