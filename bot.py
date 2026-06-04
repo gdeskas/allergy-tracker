@@ -83,6 +83,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/today - today's pollen + your logged symptoms\n"
         "/week - last 7 days summary\n"
+        "/delete YYYY-MM-DD - remove all logged symptoms for that date\n"
         "/help - show this again\n\n"
         f"Your chat id is {chat_id}. Put it in ALLOWED_CHAT_ID to keep the bot private."
     )
@@ -124,6 +125,39 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(msg), parse_mode="Markdown")
 
 
+async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    arg = " ".join(context.args).strip().lower() if context.args else ""
+    now = datetime.now(TZ)
+    if not arg or arg == "today":
+        target = now.date()
+    else:
+        try:
+            target = datetime.strptime(arg, "%Y-%m-%d").date()
+        except ValueError:
+            await update.message.reply_text(
+                "Usage: /delete YYYY-MM-DD  or  /delete today"
+            )
+            return
+
+    day_start = datetime(target.year, target.month, target.day, tzinfo=TZ)
+    syms = db.symptoms_between(day_start.isoformat(), (day_start + timedelta(days=1)).isoformat())
+    if not syms:
+        await update.message.reply_text(f"No symptoms logged on {target}.")
+        return
+
+    count = db.delete_symptoms_for_date(
+        day_start.isoformat(), (day_start + timedelta(days=1)).isoformat()
+    )
+    lines = [f"Deleted {count} entry(s) from {target}:"]
+    for s in syms:
+        t = datetime.fromisoformat(s["ts"]).strftime("%H:%M")
+        sev = f" [{s['severity']}/5]" if s["severity"] else ""
+        lines.append(f"  {t}{sev} - {s['notes']}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
@@ -153,6 +187,7 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("week", week))
+    app.add_handler(CommandHandler("delete", delete))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_symptom))
 
     log.info("Bot started. Long-polling for messages...")

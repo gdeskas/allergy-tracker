@@ -52,3 +52,12 @@ def symptoms_between(start_iso, end_iso):
             (start_iso, end_iso),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def delete_symptoms_for_date(start_iso, end_iso):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM symptoms WHERE ts >= ? AND ts < ?",
+            (start_iso, end_iso),
+        )
+        return cur.rowcount
