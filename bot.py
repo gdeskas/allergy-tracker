@@ -16,10 +16,12 @@ import re
 from datetime import date as date_type, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
+    ConversationHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -35,6 +37,44 @@ logging.basicConfig(
 log = logging.getLogger("allergy-bot")
 
 TZ = ZoneInfo(config.TIMEZONE)
+
+# Conversation states
+SYMPTOM_SELECTION, SEVERITY_SELECTION = range(2)
+
+SYMPTOM_OPTIONS = [
+    ("Sneezing",            "sneezing"),
+    ("Runny nose",          "runny_nose"),
+    ("Itchy eyes",          "itchy_eyes"),
+    ("Congestion",          "congestion"),
+    ("Headache",            "headache"),
+    ("Skin irritation",     "skin_irritation"),
+    ("Shortness of breath", "short_breath"),
+    ("Fatigue",             "fatigue"),
+]
+
+def _symptom_keyboard(selected: set) -> InlineKeyboardMarkup:
+    rows = []
+    pair = []
+    for label, key in SYMPTOM_OPTIONS:
+        mark = "✅" if key in selected else "☐"
+        pair.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"sym:{key}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([
+        InlineKeyboardButton("❌ Cancel", callback_data="sym:cancel"),
+        InlineKeyboardButton("Done →",   callback_data="sym:done"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _severity_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(str(i), callback_data=f"sev:{i}") for i in range(1, 6)
+    ]])
+
 
 _SEVERITY_PATTERNS = [
     re.compile(r"(\d)\s*/\s*5"),
@@ -78,31 +118,80 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(
         "Hi! I'm your allergy tracker.\n\n"
-        "Whenever symptoms hit, just message me what's going on and I'll log it "
-        "with a timestamp. Add a 1-5 rating (e.g. '3/5') and I'll store the "
-        "severity too.\n\n"
+        "Send any message to open the symptom picker — tap what you're "
+        "experiencing, then rate the severity on a 1–5 scale.\n\n"
         "Commands:\n"
         "/today - today's pollen + your logged symptoms\n"
         "/week - last 7 days summary\n"
-        "/analyze - 30-day symptom/pollen correlation\n"
-        "/log YYYY-MM-DD [HH:MM] <text> - log a historical symptom\n"
+        "/analyze - full-history symptom/pollen correlation\n"
+        "/log YYYY-MM-DD [HH:MM] <text> - backfill a historical symptom\n"
         "/delete YYYY-MM-DD - remove all logged symptoms for that date\n"
         "/help - show this again\n\n"
         f"Your chat id is {chat_id}. Put it in ALLOWED_CHAT_ID to keep the bot private."
     )
 
 
-async def log_symptom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_log(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point: any plain-text message opens the symptom picker."""
     if not _authorized(update):
-        return
-    text = update.message.text.strip()
-    severity = parse_severity(text)
-    now = datetime.now(TZ)
-    db.insert_symptom(
-        now.isoformat(), severity, text, str(update.effective_chat.id), text
+        return ConversationHandler.END
+    context.user_data["selected"] = set()
+    await update.message.reply_text(
+        "What are you experiencing? Tap to select, then press *Done →*",
+        reply_markup=_symptom_keyboard(set()),
+        parse_mode="Markdown",
     )
-    suffix = f" (severity {severity}/5)" if severity is not None else ""
-    await update.message.reply_text(f"Logged at {now:%H:%M}{suffix}. Hope you feel better.")
+    return SYMPTOM_SELECTION
+
+
+async def toggle_symptom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle symptom checkbox taps and the Done / Cancel buttons."""
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+
+    if action == "cancel":
+        await query.edit_message_text("Cancelled.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if action == "done":
+        selected = context.user_data.get("selected", set())
+        if not selected:
+            await query.answer("Select at least one symptom first.", show_alert=True)
+            return SYMPTOM_SELECTION
+        await query.edit_message_text(
+            "How severe? (1 = very mild, 5 = worst ever)",
+            reply_markup=_severity_keyboard(),
+        )
+        return SEVERITY_SELECTION
+
+    selected = context.user_data.setdefault("selected", set())
+    if action in selected:
+        selected.discard(action)
+    else:
+        selected.add(action)
+    await query.edit_message_reply_markup(_symptom_keyboard(selected))
+    return SYMPTOM_SELECTION
+
+
+async def select_severity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Log the entry once severity is chosen."""
+    query = update.callback_query
+    await query.answer()
+    severity = int(query.data.split(":", 1)[1])
+
+    selected = context.user_data.get("selected", set())
+    notes = ", ".join(label for label, key in SYMPTOM_OPTIONS if key in selected)
+
+    now = datetime.now(TZ)
+    db.insert_symptom(now.isoformat(), severity, notes, str(query.from_user.id), notes)
+
+    await query.edit_message_text(
+        f"Logged at {now:%H:%M} (severity {severity}/5):\n{notes}\n\nHope you feel better soon."
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -387,7 +476,15 @@ def main():
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("log", log_historical))
     app.add_handler(CommandHandler("delete", delete))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, log_symptom))
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, start_log)],
+        states={
+            SYMPTOM_SELECTION: [CallbackQueryHandler(toggle_symptom, pattern=r"^sym:")],
+            SEVERITY_SELECTION: [CallbackQueryHandler(select_severity, pattern=r"^sev:")],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+        per_message=False,
+    ))
 
     log.info("Bot started. Long-polling for messages...")
     app.run_polling()
