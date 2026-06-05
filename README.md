@@ -3,13 +3,13 @@
 Split across two always-on places, meeting in the repo — no database server needed.
 
 ```
-GitHub Actions (daily)            Mac Mini (always on)
+GitHub Actions (daily)            Mac (always on)
   collect_pollen.py                 bot.py  ──► allergy.db   (your symptoms)
         │ writes                       │ reads
         ▼                              ▼
   data/pollen.csv  ◄──── committed ───► raw.githubusercontent.com/.../pollen.csv
-        ▲                              │
-        └──────── analyze.py ──────────┘  (joins both on date)
+                                       │
+                                  /analyze joins both on date
 ```
 
 - **Actions** runs the collector once a day, writes `data/pollen.csv`, and commits it back. Open-Meteo is keyless, so **the workflow needs no secrets**.
@@ -26,7 +26,7 @@ Requires Python 3.10+.
 | `pollen_store.py` | both | CSV read/upsert (reads local path or raw URL) |
 | `bot.py` | Mac | Telegram bot; symptoms → SQLite |
 | `db.py` | Mac | SQLite store for symptoms |
-| `analyze.py` | anywhere | join pollen + symptoms, correlations, optional plot |
+| `analyze.py` | anywhere | standalone script: join pollen + symptoms, correlations, optional plot |
 | `.github/workflows/collect-pollen.yml` | Actions | daily schedule + commit step |
 
 ## Setup — GitHub side (collector)
@@ -82,32 +82,44 @@ Save as `~/Library/LaunchAgents/com.you.allergybot.plist`, then
 </plist>
 ```
 
-`launchd` restarts it on crash and on login, which suits an always-on Mac Mini.
+`launchd` restarts it on crash and on login, which suits an always-on Mac.
 
-### Using the bot
+## Using the bot
 
-- Send any text → logged with a timestamp. Add `3/5` or `severity 3` to record severity.
-- `/today` — today's pollen + symptoms logged today.
-- `/week` — last 7 days: symptom counts next to grass/birch peaks.
+**Logging a symptom** — send any message to open the symptom picker:
 
-## Compare symptoms vs pollen
+1. Tap to select what you're experiencing (multi-select):
+   `☐ Sneezing` `☐ Runny nose` `☐ Itchy eyes` `☐ Congestion`
+   `☐ Headache` `☐ Skin irritation` `☐ Shortness of breath` `☐ Fatigue`
+2. Press **Done →**
+3. Rate severity: `1` `2` `3` `4` `5` (1 = very mild, 5 = worst ever)
 
-```bash
-python analyze.py          # daily table + same-day and 1-day-lag correlations
-python analyze.py --plot   # also writes symptoms_vs_pollen.png
-```
+The entry is logged with a timestamp. Tap **❌ Cancel** or send `/cancel` to abort.
 
-Or load it yourself — pollen is a plain CSV you can read from anywhere:
+**Commands:**
 
-```python
-import pandas as pd, sqlite3
-pollen = pd.read_csv("https://raw.githubusercontent.com/<you>/<repo>/main/data/pollen.csv")
-symptoms = pd.read_sql("SELECT * FROM symptoms", sqlite3.connect("allergy.db"))
-```
+| Command | What it does |
+|---------|-------------|
+| `/today` | Today's pollen levels + all symptoms logged today |
+| `/week` | Last 7 days: symptom count vs grass/birch pollen per day |
+| `/analyze` | Full-history correlation: which pollen types likely trigger your symptoms |
+| `/log YYYY-MM-DD [HH:MM] <text>` | Backfill a symptom for a past date (free text, optional `3/5` severity) |
+| `/delete YYYY-MM-DD` | Remove all logged symptoms for that date |
+| `/help` | Show the intro message |
+
+## `/analyze` — trigger identification
+
+`/analyze` looks across your full recorded history and correlates symptom days with pollen levels. It reports:
+
+- **Likely triggers** — species ranked by how much higher their pollen is on days you logged symptoms vs clear days (ratio + absolute lift).
+- **Above/below median breakdown** — for the top trigger species, what % of high-pollen days had symptoms vs low-pollen days.
+- **Severity vs pollen** — average pollen on mild (≤2) vs severe (≥4) days.
+
+The window grows automatically as more data accumulates — no fixed cutoff.
 
 ## Notes on the data
 
 - Pollen is from the **CAMS European** model via Open-Meteo (~11 km, Europe only — Edinburgh covered), in grains/m³. It's a short forecast, not deep history, which is why the daily job builds your own record over time. Run the workflow soon so history starts accumulating.
-- Species: alder, birch, grass, mugwort, olive, ragweed. For Scotland, **grass and birch (and alder in early spring)** matter; olive/ragweed are usually ~0.
+- Species tracked: alder, birch, grass, mugwort, olive, ragweed. For Scotland, **grass and birch (and alder in early spring)** matter most; olive/ragweed are usually ~0.
 
 _Not medical advice — a personal tracking tool._
